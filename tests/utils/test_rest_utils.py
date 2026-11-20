@@ -1,3 +1,4 @@
+import base64
 import importlib
 import json
 import pkgutil
@@ -50,6 +51,7 @@ from mlflow.tracking.request_header.default_request_header_provider import (
     _USER_AGENT,
     DefaultRequestHeaderProvider,
 )
+from mlflow.utils.databricks_utils import get_databricks_host_creds
 from mlflow.utils.rest_utils import (
     _DATABRICKS_SDK_RETRY_AFTER_SECS_DEPRECATION_WARNING,
     _RETRY_SAFE_POST_RESPONSES,
@@ -119,6 +121,102 @@ def test_call_endpoint_surfaces_server_error_after_retries_on_5xx(monkeypatch, m
             thread.join()
 
     assert request_count == max_retries + 1
+
+
+def test_databricks_sdk_client_recovers_after_oauth_secret_rotation(monkeypatch, tmp_path):
+    # A service principal's secret is rotated while the process runs: the old one is revoked and
+    # the new one is put in DATABRICKS_CLIENT_SECRET. The cached WorkspaceClient must pick it up.
+    valid_secret = "secret-v1"
+    tokens = set()
+    secrets_sent = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            host = f"http://{self.headers['Host']}"
+            if self.path == "/oidc/.well-known/oauth-authorization-server":
+                return self._send(
+                    200,
+                    {
+                        "authorization_endpoint": f"{host}/oidc/v1/authorize",
+                        "token_endpoint": f"{host}/oidc/v1/token",
+                    },
+                )
+            if self.headers.get("Authorization", "").removeprefix("Bearer ") in tokens:
+                return self._send(200, {"experiment": {"experiment_id": "1"}})
+            return self._send(401, {"error_code": "UNAUTHENTICATED", "message": "invalid token"})
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            basic = self.headers["Authorization"].removeprefix("Basic ")
+            secret = base64.b64decode(basic).decode().split(":", 1)[1]
+            secrets_sent.append(secret)
+            if secret != valid_secret:
+                return self._send(
+                    401,
+                    {
+                        "error": "invalid_client",
+                        "error_description": "Client authentication failed",
+                    },
+                )
+            tokens.add(f"token-{len(tokens)}")
+            # Already expired, so every request exchanges the secret again.
+            return self._send(
+                200,
+                {
+                    "access_token": f"token-{len(tokens) - 1}",
+                    "token_type": "Bearer",
+                    "expires_in": -1,
+                },
+            )
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(
+            target=server.serve_forever, name="test-rotation-server", daemon=True
+        )
+        thread.start()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        host = f"http://127.0.0.1:{server.server_port}"
+        monkeypatch.setenv("DATABRICKS_HOST", host)
+        # The test session stubs out host metadata, so point the SDK at the OIDC endpoints directly.
+        monkeypatch.setenv(
+            "DATABRICKS_DISCOVERY_URL", f"{host}/oidc/.well-known/oauth-authorization-server"
+        )
+        monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "oauth-m2m")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "example-sp")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v1")
+        get_workspace_client.cache_clear()
+
+        def get_experiment():
+            return http_request(
+                get_databricks_host_creds("databricks"),
+                "/api/2.0/mlflow/experiments/get",
+                "GET",
+                params={"experiment_id": "1"},
+            )
+
+        try:
+            assert get_experiment().status_code == 200
+
+            valid_secret = "secret-v2"
+            monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-v2")
+
+            assert get_experiment().status_code == 200
+            assert secrets_sent[-1] == "secret-v2"
+        finally:
+            get_workspace_client.cache_clear()
+            server.shutdown()
+            thread.join()
 
 
 def _send_post(response_proto, status_code=200, delay_seconds=0, headers=None):
